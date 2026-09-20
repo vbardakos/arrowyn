@@ -1,0 +1,6 @@
+# pyo3's `extension-module` feature intentionally does not link libpython;
+# the symbols are resolved when CPython dlopen()s the module. On macOS the
+# linker needs to be told that explicitly, otherwise `cargo build`/`cargo run`
+# fails with "Undefined symbols: _PyBool_Type, ...". maturin passes this itself.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

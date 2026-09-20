@@ -1,4 +1,3 @@
-mod manifest;
 mod store;
 
 use pyo3::prelude::*;
