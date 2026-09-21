@@ -56,7 +56,7 @@ impl CaskStore {
         })
     }
 
-    pub fn get<D>(&mut self, key: &[u8]) -> Option<Result<D, CaskStoreError>>
+    pub fn get<D>(&self, key: &[u8]) -> Option<Result<D, CaskStoreError>>
     where
         D: Decode<()>,
     {
@@ -67,6 +67,34 @@ impl CaskStore {
         match decode_from_slice::<D>(source, config::standard()) {
             Ok((payload, _)) => Some(Ok(payload)),
             Err(e) => Some(e.map_err(CaskStoreError::DecodeError)),
+        }
+    }
+
+    pub fn get_history<D>(&self, key: &[u8]) -> Box<dyn Iterator + '_>
+    where
+        D: Decode<()>,
+    {
+        if let Some((init, _)) = self.find_offset(key) {
+            let keylen = key.len();
+            unsafe { self.prev_recs(init) }
+                .map(|offset| {
+                    let reclen = unsafe {
+                        self.mmap
+                            .get_unchecked(Self::RECLEN.rshift(offset))
+                            .get_u32(0..4)
+                    };
+                    let prange = (Self::KEYLEN.end + keylen..reclen).rshift(offset);
+                    let source = unsafe { self.mmap.get_unchecked(prange) };
+
+                    Box::new(
+                        decode_from_slice::<D>(source, config::standard())
+                            .map(|(p, _)| p)
+                            .map_err(CaskStoreError::DecodeError),
+                    )
+                })
+                .into()
+        } else {
+            Box::new(std::iter::empty())
         }
     }
 
