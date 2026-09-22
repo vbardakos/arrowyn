@@ -98,21 +98,6 @@ impl CaskStore {
                     .map(|(p, _)| p)
                     .map_err(CaskStoreError::DecodeError)
             })
-
-        // unsafe { self.prev_recs(offset) }
-        // .map(|offset| {
-        //     let reclen = unsafe {
-        //         self.mmap
-        //             .get_unchecked(Self::RECLEN.rshift(offset))
-        //             .get_u32(0..4)
-        //     } as usize;
-        //     let prange = (Self::KEYLEN.end + keylen..reclen).rshift(offset);
-        //     let source = unsafe { self.mmap.get_unchecked(prange) };
-        //
-        //     decode_from_slice::<D, _>(source, config::standard())
-        //         .map(|(p, _)| p)
-        //         .map_err(CaskStoreError::DecodeError)
-        // })
     }
 
     /// Upserts new record; the new record doesn't appear until commit
