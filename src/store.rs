@@ -1,8 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Debug, FromFn},
+    fmt::Debug,
     fs::{File, OpenOptions},
-    io::{Seek, SeekFrom},
     ops::{Deref, Range},
     os::unix::fs::FileExt,
     path::Path,
@@ -10,7 +9,6 @@ use std::{
 };
 
 use bincode_next::{Decode, Encode, config, decode_from_slice};
-use pyo3::marshal::VERSION;
 use thiserror::Error;
 
 const CURR_VERSION: u8 = 0;
@@ -48,15 +46,15 @@ impl CaskStore {
             .into();
 
         Ok(Self {
+            mmap: unsafe { memmap2::Mmap::map(&file.0)? },
             file,
-            mmap: unsafe { memmap2::Mmap::map(&file)? },
             read_cache: HashMap::new(),
             purge_cache: HashSet::new(),
             uncommitted: u32::MAX,
         })
     }
 
-    pub fn get<D>(&self, key: &[u8]) -> Option<Result<D, CaskStoreError>>
+    pub fn get<D>(&mut self, key: &[u8]) -> Option<Result<D, CaskStoreError>>
     where
         D: Decode<()>,
     {
@@ -64,44 +62,63 @@ impl CaskStore {
 
         let prange = (Self::KEYLEN.end + key.len()..reclen).rshift(offset);
         let source = unsafe { self.mmap.get_unchecked(prange) };
-        match decode_from_slice::<D>(source, config::standard()) {
+        match decode_from_slice::<D, _>(source, config::standard()) {
             Ok((payload, _)) => Some(Ok(payload)),
-            Err(e) => Some(e.map_err(CaskStoreError::DecodeError)),
+            Err(e) => Some(Err(e.into())),
         }
     }
 
-    pub fn get_history<D>(&self, key: &[u8]) -> Box<dyn Iterator + '_>
+    pub fn get_history<D>(&mut self, key: &[u8]) -> impl Iterator<Item = Result<D, CaskStoreError>>
     where
         D: Decode<()>,
     {
-        if let Some((init, _)) = self.find_offset(key) {
-            let keylen = key.len();
-            unsafe { self.prev_recs(init) }
-                .map(|offset| {
-                    let reclen = unsafe {
-                        self.mmap
-                            .get_unchecked(Self::RECLEN.rshift(offset))
-                            .get_u32(0..4)
-                    };
-                    let prange = (Self::KEYLEN.end + keylen..reclen).rshift(offset);
-                    let source = unsafe { self.mmap.get_unchecked(prange) };
+        let mut offset = self
+            .find_offset(key)
+            .map(|(o, _)| o)
+            .unwrap_or(u32::MAX as usize);
 
-                    Box::new(
-                        decode_from_slice::<D>(source, config::standard())
-                            .map(|(p, _)| p)
-                            .map_err(CaskStoreError::DecodeError),
-                    )
-                })
-                .into()
-        } else {
-            Box::new(std::iter::empty())
-        }
+        let keylen = key.len();
+        let this: &Self = &*self;
+
+        std::iter::once(offset)
+            .filter_map(move |offset| {
+                (offset as u32 != u32::MAX).then(|| unsafe { this.prev_recs(offset) })
+            })
+            .flatten()
+            .map(move |offset| {
+                let reclen = unsafe {
+                    this.mmap
+                        .get_unchecked(Self::RECLEN.rshift(offset))
+                        .get_u32(0..4)
+                } as usize;
+                let prange = (Self::KEYLEN.end + keylen..reclen).rshift(offset);
+                let source = unsafe { this.mmap.get_unchecked(prange) };
+
+                decode_from_slice::<D, _>(source, config::standard())
+                    .map(|(p, _)| p)
+                    .map_err(CaskStoreError::DecodeError)
+            })
+
+        // unsafe { self.prev_recs(offset) }
+        // .map(|offset| {
+        //     let reclen = unsafe {
+        //         self.mmap
+        //             .get_unchecked(Self::RECLEN.rshift(offset))
+        //             .get_u32(0..4)
+        //     } as usize;
+        //     let prange = (Self::KEYLEN.end + keylen..reclen).rshift(offset);
+        //     let source = unsafe { self.mmap.get_unchecked(prange) };
+        //
+        //     decode_from_slice::<D, _>(source, config::standard())
+        //         .map(|(p, _)| p)
+        //         .map_err(CaskStoreError::DecodeError)
+        // })
     }
 
     /// Upserts new record; the new record doesn't appear until commit
-    pub fn upsert<Codec, Ctx>(&mut self, key: &[u8], payload: Codec)
+    pub fn upsert<Codec>(&mut self, key: &[u8], payload: Codec)
     where
-        Codec: Encode + Decode<Ctx>,
+        Codec: Encode + Decode<()>,
     {
         todo!()
     }
@@ -139,12 +156,9 @@ impl CaskStore {
                 // SAFETY: all fields range bounds are checked
                 let rec: &[u8] = buf.get_unchecked(offset..offset + reclen);
                 if let Some(marker) = Self::match_rec(&rec, &key, len, markers) {
-                    let mut marker = marker;
                     if marker == UncommittedAlive {
-                        let offset = self.prev_recs(offset).next() else {
-                            return None;
-                        };
-                    }
+                        offset = self.prev_recs(offset).next()?;
+                    };
 
                     self.read_cache.insert(key.to_vec(), (offset, reclen));
                     return Some((offset, reclen));
@@ -160,17 +174,17 @@ impl CaskStore {
     // SAFETY: assumes all necessary checks have already been done before the call
     unsafe fn match_rec(rec: &[u8], key: &[u8], len: &[u8], markers: &[Marker]) -> Option<Marker> {
         unsafe {
-            if VERSION != rec.get_unchecked(Self::VERSION) {
+            if &CURR_VERSION != rec.get_unchecked(Self::VERSION.start) {
                 return None;
             }
 
-            let mut marker = rec.get_marker(Self::MARKER);
+            let marker = rec.get_marker(Self::MARKER);
             if markers.contains(&marker) {
                 return None;
             }
 
-            let actual_len: &[u8] = rec.get_unchecked(Self::KEYLEN);
-            if actual_len != len {
+            let cmp_len: &[u8] = rec.get_unchecked(Self::KEYLEN);
+            if cmp_len != len {
                 return None;
             }
 
@@ -184,10 +198,11 @@ impl CaskStore {
     }
 
     fn encode<Codec>(
-        &self,
+        &mut self,
+        offset: u32,
         key: &[u8],
         payload: Codec,
-    ) -> Result<impl Fn(u32) -> Vec<u8>, CaskStoreError>
+    ) -> Result<Vec<u8>, CaskStoreError>
     where
         Codec: Encode + Decode<()>,
     {
@@ -203,7 +218,7 @@ impl CaskStore {
         rec.push(CURR_VERSION);
         rec.extend_from_slice(&total_len.to_be_bytes());
         rec.push(Marker::Reserved as u8);
-        rec.extend_from_slice(&[0; 4]);
+        rec.extend_from_slice(&offset.to_be_bytes());
         rec.extend_from_slice(
             &self
                 .find_offset(key)
@@ -217,11 +232,7 @@ impl CaskStore {
         rec.extend_from_slice(key);
         rec.extend_from_slice(payload.as_slice());
 
-        let closure = move |offset: u32| {
-            rec[Self::OFFSET] = offset.to_be_bytes();
-            rec
-        };
-        Ok(closure)
+        Ok(rec)
     }
 
     unsafe fn swap_marker(&mut self, offset: usize, marker: Marker) -> Marker {
@@ -239,17 +250,17 @@ impl CaskStore {
                 .unwrap_unchecked();
 
             // SAFETY: marker is expected to be correct at this point
-            Marker::try_from(old_marker.get_unchecked(0)).unwrap_unchecked()
+            Marker::try_from(*old_marker.get_unchecked(0)).unwrap_unchecked()
         }
     }
 
+    // SAFETY: initial offset is assumed to be valid
     unsafe fn prev_recs(&self, offset: usize) -> impl Iterator<Item = usize> {
         let mut offset = offset;
-        let mut enc_offset: &[u8];
         std::iter::from_fn(move || unsafe {
-            enc_offset = self.mmap.get_unchecked(Self::PRV_OFFSET.rshift(offset));
-            offset = enc_offset.get_u32(0..4) as usize;
-            if offset == u32::MAX {
+            let prev_offset: &[u8] = self.mmap.get_unchecked(Self::PRV_OFFSET.rshift(offset));
+            offset = prev_offset.get_u32(0..4) as usize;
+            if (offset as u32) == u32::MAX {
                 None
             } else {
                 Some(offset)
@@ -295,7 +306,7 @@ impl TryFrom<u8> for Marker {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct FileGuard(File);
 
 impl From<File> for FileGuard {
@@ -351,7 +362,7 @@ impl<'a> DecodeExt for &'a [u8] {
     }
 
     unsafe fn get_marker(&self, r: Range<usize>) -> Marker {
-        unsafe { Marker::try_from(self.get_unchecked(r)).unwrap_unchecked() }
+        unsafe { Marker::try_from(self.get_unchecked(r)[0]).unwrap_unchecked() }
     }
 }
 
