@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     fs::{File, OpenOptions},
+    io::{Seek, Write},
     ops::{Deref, Range},
     os::unix::fs::FileExt,
     path::Path,
@@ -18,7 +19,7 @@ pub type RecordLen = usize;
 
 #[derive(Debug)]
 pub struct CaskStore {
-    file: FileGuard,
+    file: GuardedFile,
     mmap: memmap2::Mmap,
     read_cache: HashMap<Vec<u8>, (Offset, RecordLen)>,
     purge_cache: HashSet<(Offset, RecordLen)>,
@@ -38,7 +39,7 @@ impl CaskStore {
     const HEAD_LEN: usize = Self::FLAGS.end;
 
     pub fn try_new<P: AsRef<Path>>(pathlike: P) -> std::io::Result<Self> {
-        let file: FileGuard = OpenOptions::new()
+        let file: GuardedFile = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -101,11 +102,49 @@ impl CaskStore {
     }
 
     /// Upserts new record; the new record doesn't appear until commit
-    pub fn upsert<Codec>(&mut self, key: &[u8], payload: Codec)
+    pub fn upsert<Codec>(&mut self, key: &[u8], payload: Codec) -> Result<(), CaskStoreError>
     where
         Codec: Encode + Decode<()>,
     {
-        todo!()
+        let guard = self.file.lock()?;
+        let mut new_offset = self.file.seek(std::io::SeekFrom::End(0))? as u32;
+        let mut encoded = self.encode(new_offset, key, payload)?;
+        self.file.write_all(&mut encoded)?;
+
+        // new: reserved -> reserved -> uncalive -> uncalive -> alive
+        // old: alive    -> uncsuper -> uncsuper -> supersed -> superseded
+        if old_offset == u32::MAX {
+            loop {
+                match self.file.try_lock() {
+                    Ok(()) => unsafe {
+                        self.swap_marker(new_offset as usize, Marker::Alive);
+                    },
+                    Err(std::fs::TryLockError::WouldBlock) => (),
+                    Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                }
+            }
+        } else {
+            let old_offset = self
+                .find_offset(key)
+                .map(|(o, _)| o as u32)
+                .unwrap_or(u32::MAX);
+
+            loop {
+                match self.file.try_lock() {
+                    Ok(()) => unsafe {
+                        self.swap_marker(old_offset as usize, Marker::UncommittedSuperseded);
+                        self.swap_marker(new_offset as usize, Marker::UncommittedAlive);
+                        self.swap_marker(old_offset as usize, Marker::Superseded);
+                        self.swap_marker(new_offset as usize, Marker::Alive);
+                        break;
+                    },
+                    Err(std::fs::TryLockError::WouldBlock) => (),
+                    Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn commit(&mut self) {
@@ -292,15 +331,15 @@ impl TryFrom<u8> for Marker {
 }
 
 #[derive(Debug)]
-pub struct FileGuard(File);
+pub struct GuardedFile(File);
 
-impl From<File> for FileGuard {
+impl From<File> for GuardedFile {
     fn from(value: File) -> Self {
-        FileGuard(value)
+        GuardedFile(value)
     }
 }
 
-impl Deref for FileGuard {
+impl Deref for GuardedFile {
     type Target = File;
 
     fn deref(&self) -> &Self::Target {
@@ -308,9 +347,18 @@ impl Deref for FileGuard {
     }
 }
 
-impl Drop for FileGuard {
+impl GuardedFile {
+    fn lock(&self) -> Result<LockGuard<'_>, CaskStoreError> {
+        self.0.lock()?;
+        Ok(LockGuard(&self.0))
+    }
+}
+
+struct LockGuard<'a>(&'a File);
+
+impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
-        self.0.unlock().unwrap()
+        let _ = self.0.unlock();
     }
 }
 
@@ -361,4 +409,17 @@ pub enum CaskStoreError {
     TimestampError(#[from] std::time::SystemTimeError),
     #[error("{0}")]
     Other(String),
+    #[error("failed to upsert record: {0}")]
+    LockError(#[from] std::fs::TryLockError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bincode_next::{Decode, Encode};
+
+    #[derive(Debug, Decode, Encode)]
+    pub struct Payload {
+        x: isize,
+    }
 }
